@@ -4,15 +4,23 @@
 
 .DESCRIPTION
     This script identifies authentication weaknesses, legacy protocols,
-    MFA gaps, and privileged access concerns in Microsoft 365. Critical
-    for environments that grew without formal security policies.
+    MFA gaps, privileged access concerns, and inactive user accounts in
+    Microsoft 365. Critical for environments that grew without formal
+    security policies.
 
 .PARAMETER OutputFolder
     Folder path for exported data. Defaults to ..\Data\[timestamp]
 
+.PARAMETER InactiveDaysThreshold
+    Number of days without sign-in to consider an account inactive. Defaults to 30.
+
 .EXAMPLE
     .\06-Export-SecurityHygiene.ps1
     Export security hygiene data with default settings.
+
+.EXAMPLE
+    .\06-Export-SecurityHygiene.ps1 -InactiveDaysThreshold 90
+    Check for accounts inactive for 90+ days instead of default 30.
 
 .NOTES
     Author: IT Audit
@@ -26,7 +34,10 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory=$false)]
-    [string]$OutputFolder
+    [string]$OutputFolder,
+
+    [Parameter(Mandatory=$false)]
+    [int]$InactiveDaysThreshold = 30
 )
 
 $ErrorActionPreference = "Continue"
@@ -54,7 +65,7 @@ Write-Host "`nOutput folder: $OutputFolder" -ForegroundColor Yellow
 Write-Host ""
 
 #region Legacy Authentication Protocols
-Write-Host "[1/6] Checking legacy authentication protocols..." -ForegroundColor Yellow
+Write-Host "[1/7] Checking legacy authentication protocols..." -ForegroundColor Yellow
 
 try {
     # Check for POP3/IMAP enabled mailboxes
@@ -92,7 +103,7 @@ try {
 #endregion
 
 #region MFA Status
-Write-Host "[2/6] Checking MFA enrollment..." -ForegroundColor Yellow
+Write-Host "[2/7] Checking MFA enrollment..." -ForegroundColor Yellow
 
 try {
     $allUsers = Get-MgUser -All -Property Id,DisplayName,UserPrincipalName,AccountEnabled
@@ -141,7 +152,7 @@ try {
 #endregion
 
 #region Privileged Accounts
-Write-Host "[3/6] Auditing privileged accounts..." -ForegroundColor Yellow
+Write-Host "[3/7] Auditing privileged accounts..." -ForegroundColor Yellow
 
 try {
     $adminRoles = Get-MgDirectoryRole -All
@@ -192,7 +203,7 @@ try {
 #endregion
 
 #region Conditional Access Policies
-Write-Host "[4/6] Checking Conditional Access policies..." -ForegroundColor Yellow
+Write-Host "[4/7] Checking Conditional Access policies..." -ForegroundColor Yellow
 
 try {
     $caPolicies = Get-MgIdentityConditionalAccessPolicy -All
@@ -235,7 +246,7 @@ try {
 #endregion
 
 #region Password Policy
-Write-Host "[5/6] Checking password policies..." -ForegroundColor Yellow
+Write-Host "[5/7] Checking password policies..." -ForegroundColor Yellow
 
 try {
     $orgSettings = Get-MgOrganization
@@ -261,8 +272,149 @@ try {
 }
 #endregion
 
+#region Inactive User Accounts
+Write-Host "[6/7] Checking for inactive user accounts..." -ForegroundColor Yellow
+
+try {
+    # Calculate the cutoff date
+    $cutoffDate = (Get-Date).AddDays(-$InactiveDaysThreshold)
+    Write-Host "  [INFO] Looking for accounts with no sign-in since $($cutoffDate.ToString('yyyy-MM-dd'))" -ForegroundColor Gray
+
+    # Get all users with sign-in activity and license info
+    $inactiveUsers = @()
+    $usersWithSignIn = Get-MgUser -All -Property Id,DisplayName,UserPrincipalName,AccountEnabled,UserType,CreatedDateTime,AssignedLicenses,SignInActivity
+
+    # Get SKU info for license names
+    $skus = Get-MgSubscribedSku
+    $skuHashtable = @{}
+    foreach ($sku in $skus) {
+        $skuHashtable[$sku.SkuId] = $sku.SkuPartNumber
+    }
+
+    $userCount = 0
+    $totalUsers = ($usersWithSignIn | Where-Object { $_.UserType -eq 'Member' }).Count
+
+    foreach ($user in $usersWithSignIn | Where-Object { $_.UserType -eq 'Member' }) {
+        $userCount++
+        if ($userCount % 50 -eq 0) {
+            Write-Progress -Activity "Analyzing user sign-in activity" -Status "$userCount of $totalUsers" -PercentComplete (($userCount / $totalUsers) * 100)
+        }
+
+        # Get last sign-in date
+        $lastSignIn = $null
+        $daysSinceSignIn = $null
+
+        if ($user.SignInActivity) {
+            # Use the most recent of either interactive or non-interactive sign-in
+            $lastInteractive = $user.SignInActivity.LastSignInDateTime
+            $lastNonInteractive = $user.SignInActivity.LastNonInteractiveSignInDateTime
+
+            if ($lastInteractive -and $lastNonInteractive) {
+                $lastSignIn = [DateTime]::Compare($lastInteractive, $lastNonInteractive) -gt 0 ? $lastInteractive : $lastNonInteractive
+            } elseif ($lastInteractive) {
+                $lastSignIn = $lastInteractive
+            } elseif ($lastNonInteractive) {
+                $lastSignIn = $lastNonInteractive
+            }
+        }
+
+        # Determine if user is inactive
+        $isInactive = $false
+        $reason = ""
+
+        if ($null -eq $lastSignIn) {
+            # Never signed in
+            $accountAge = (Get-Date) - $user.CreatedDateTime
+            if ($accountAge.Days -gt $InactiveDaysThreshold) {
+                $isInactive = $true
+                $reason = "Never signed in (account created $([math]::Round($accountAge.Days)) days ago)"
+                $daysSinceSignIn = [math]::Round($accountAge.Days)
+            }
+        } elseif ($lastSignIn -lt $cutoffDate) {
+            # Hasn't signed in within threshold
+            $isInactive = $true
+            $daysSinceSignIn = [math]::Round(((Get-Date) - $lastSignIn).Days)
+            $reason = "No sign-in for $daysSinceSignIn days"
+        }
+
+        # If inactive, collect details
+        if ($isInactive) {
+            # Get license info
+            $licenses = @()
+            if ($user.AssignedLicenses.Count -gt 0) {
+                foreach ($license in $user.AssignedLicenses) {
+                    $skuName = $skuHashtable[$license.SkuId]
+                    if ($skuName) {
+                        $licenses += $skuName
+                    }
+                }
+            }
+            $licensesString = ($licenses -join "; ")
+
+            # Determine risk level
+            $riskLevel = "Low"
+            if ($user.AccountEnabled -and $licenses.Count -gt 0) {
+                $riskLevel = "High"
+            } elseif ($user.AccountEnabled) {
+                $riskLevel = "Medium"
+            }
+
+            $inactiveUsers += [PSCustomObject]@{
+                DisplayName = $user.DisplayName
+                UserPrincipalName = $user.UserPrincipalName
+                AccountEnabled = $user.AccountEnabled
+                LastSignIn = if ($lastSignIn) { $lastSignIn.ToString('yyyy-MM-dd HH:mm:ss') } else { "Never" }
+                DaysSinceSignIn = $daysSinceSignIn
+                AccountCreated = $user.CreatedDateTime.ToString('yyyy-MM-dd')
+                LicensesAssigned = $licensesString
+                LicenseCount = $licenses.Count
+                RiskLevel = $riskLevel
+                Issue = $reason
+                Recommendation = if ($user.AccountEnabled -and $licenses.Count -gt 0) {
+                    "Remove licenses and disable account"
+                } elseif ($user.AccountEnabled) {
+                    "Disable account"
+                } else {
+                    "Consider deletion if no longer needed"
+                }
+            }
+        }
+    }
+
+    Write-Progress -Activity "Analyzing user sign-in activity" -Completed
+
+    # Sort by risk level and days inactive
+    $inactiveUsers = $inactiveUsers | Sort-Object @{Expression="RiskLevel";Descending=$true}, @{Expression="DaysSinceSignIn";Descending=$true}
+
+    # Export results
+    $inactiveUsers | Export-Csv -Path (Join-Path $OutputFolder "InactiveAccounts.csv") -NoTypeInformation
+
+    # Count by category
+    $highRisk = ($inactiveUsers | Where-Object { $_.RiskLevel -eq "High" }).Count
+    $mediumRisk = ($inactiveUsers | Where-Object { $_.RiskLevel -eq "Medium" }).Count
+    $lowRisk = ($inactiveUsers | Where-Object { $_.RiskLevel -eq "Low" }).Count
+
+    Write-Host "  [OK] Found $($inactiveUsers.Count) inactive accounts (no sign-in for $InactiveDaysThreshold+ days)" -ForegroundColor $(if($inactiveUsers.Count -gt 0){'Yellow'}else{'Green'})
+    if ($highRisk -gt 0) {
+        Write-Host "    - High Risk (enabled + licensed): $highRisk" -ForegroundColor Red
+    }
+    if ($mediumRisk -gt 0) {
+        Write-Host "    - Medium Risk (enabled, no license): $mediumRisk" -ForegroundColor Yellow
+    }
+    if ($lowRisk -gt 0) {
+        Write-Host "    - Low Risk (disabled): $lowRisk" -ForegroundColor Gray
+    }
+} catch {
+    Write-Warning "Failed to check inactive accounts: $_"
+    $inactiveUsers = @()
+    $highRisk = 0
+    $mediumRisk = 0
+    $lowRisk = 0
+}
+#endregion
+
 #region Summary Report
-Write-Host "[6/6] Generating security summary..." -ForegroundColor Yellow
+Write-Host "[7/7] Generating security summary..." -ForegroundColor Yellow
 
 $noMFACount = ($mfaStatus | Where-Object { -not $_.MFAEnabled }).Count
 $legacyProtocolCount = $legacyProtocolUsers.Count
@@ -282,22 +434,31 @@ PRIVILEGED ACCESS:
 - Global Administrators: $globalAdminCount $(if($globalAdminCount -gt 5){"[WARNING] (Recommendation: <5)"}else{""})
 - Admins without MFA: $adminsNoMFACount $(if($adminsNoMFACount -gt 0){"[CRITICAL] CRITICAL RISK"}else{""})
 
+INACTIVE ACCOUNTS (no sign-in for $InactiveDaysThreshold+ days):
+- Total inactive accounts: $($inactiveUsers.Count)
+- High risk (enabled + licensed): $highRisk $(if($highRisk -gt 0){"[WARNING] WASTED LICENSES"}else{""})
+- Medium risk (enabled, no license): $mediumRisk $(if($mediumRisk -gt 0){"[WARNING] SECURITY RISK"}else{""})
+- Low risk (disabled): $lowRisk
+
 CONDITIONAL ACCESS:
 - Total policies: $($caPolicies.Count)
 - Enabled policies: $enabledPolicies
 
 CRITICAL FINDINGS:
 $(if($adminsNoMFACount -gt 0){"[WARNING]  $adminsNoMFACount privileged accounts lack MFA - IMMEDIATE ACTION REQUIRED"}else{""})
+$(if($highRisk -gt 0){"[WARNING]  $highRisk enabled accounts with licenses haven't signed in for $InactiveDaysThreshold+ days - review and reclaim licenses"}else{""})
 $(if($legacyProtocolCount -gt 10){"[WARNING]  $legacyProtocolCount mailboxes using legacy authentication"}else{""})
 $(if($noMFACount -gt ($mfaStatus.Count * 0.5)){"[WARNING]  More than 50% of users lack MFA"}else{""})
 $(if($globalAdminCount -gt 5){"[WARNING]  Too many Global Administrators ($globalAdminCount) - reduce to <5"}else{""})
 
 RECOMMENDATIONS:
 1. IMMEDIATE: Enable MFA for all privileged accounts
-2. HIGH: Enforce MFA for all users via Conditional Access
-3. HIGH: Disable legacy authentication protocols (POP/IMAP/SMTP AUTH)
-4. MEDIUM: Reduce Global Administrator count to <5 (use role-based access)
-5. MEDIUM: Implement Conditional Access policies for:
+2. IMMEDIATE: Review inactive accounts with licenses assigned (potential cost savings)
+3. HIGH: Enforce MFA for all users via Conditional Access
+4. HIGH: Disable legacy authentication protocols (POP/IMAP/SMTP AUTH)
+5. HIGH: Disable or delete inactive user accounts (security risk)
+6. MEDIUM: Reduce Global Administrator count to <5 (use role-based access)
+7. MEDIUM: Implement Conditional Access policies for:
    - Require MFA for admins
    - Block legacy authentication
    - Require compliant devices
@@ -309,8 +470,11 @@ $summary | Out-File -FilePath (Join-Path $OutputFolder "SecurityHygiene-Summary.
 Write-Host "  [OK] Security summary generated" -ForegroundColor Green
 
 Write-Host "`n" + ("="*60) -ForegroundColor Cyan
-if ($adminsNoMFACount -gt 0 -or $legacyProtocolCount -gt 10 -or $globalAdminCount -gt 10) {
+if ($adminsNoMFACount -gt 0 -or $legacyProtocolCount -gt 10 -or $globalAdminCount -gt 10 -or $highRisk -gt 0) {
     Write-Host "[WARNING]  CRITICAL SECURITY ISSUES FOUND!" -ForegroundColor Red
+    if ($highRisk -gt 0) {
+        Write-Host "  - $highRisk inactive accounts still have licenses assigned (cost savings opportunity)" -ForegroundColor Yellow
+    }
 } else {
     Write-Host "Security Export Complete!" -ForegroundColor Green
 }
