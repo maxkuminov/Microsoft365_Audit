@@ -26,7 +26,7 @@ This collection of PowerShell scripts performs a comprehensive audit of your Mic
 - **03-Export-SharedMailboxes.ps1** - Documents shared mailboxes with Full Access, Send As, and Send on Behalf permissions
 - **04-Export-Groups.ps1** - Exports Microsoft 365 Groups, Teams, Distribution Lists, and Mail-Enabled Security Groups with membership details
 - **05-Export-OrphanedResources.ps1** - Identifies Teams, Groups, and Shared Mailboxes without owners, plus inactive resources
-- **06-Export-SecurityHygiene.ps1** - Analyzes MFA enrollment, legacy authentication usage, Conditional Access policies, and password policies
+- **06-Export-SecurityHygiene.ps1** - Analyzes MFA enrollment, legacy authentication usage, Conditional Access policies, password policies, and inactive user accounts
 - **07-Export-PermissionSprawl.ps1** - Audits SharePoint external sharing, anonymous links, external users, and overly permissive configurations
 - **08-Export-EmailHygiene.ps1** - Reviews mailbox forwarding rules, auto-forwarding settings, and suspicious inbox rules
 - **09-Export-ThirdPartyApps.ps1** - Documents OAuth consent grants, service principals, and high-risk third-party app permissions
@@ -371,7 +371,7 @@ As of September 2024, Microsoft deprecated the default PnP Management Shell app,
 ---
 
 #### `06-Export-SecurityHygiene.ps1`
-**Purpose:** Identify authentication weaknesses and security gaps
+**Purpose:** Identify authentication weaknesses, security gaps, and inactive accounts
 
 **What it collects:**
 - **MFA Status:** Multi-factor authentication enrollment
@@ -381,6 +381,7 @@ As of September 2024, Microsoft deprecated the default PnP Management Shell app,
 - **Conditional Access policies:** Policy configuration and coverage
 - **Password policies:** Password expiration and complexity settings
 - **Admin accounts:** Global Admins and privileged role holders
+- **Inactive user accounts:** Accounts with no sign-in activity for 30+ days
 
 **Output files:**
 - `LegacyAuthProtocols.csv` - Mailboxes using legacy authentication
@@ -388,6 +389,7 @@ As of September 2024, Microsoft deprecated the default PnP Management Shell app,
 - `PrivilegedAccounts.csv` - Admin accounts security review
 - `ConditionalAccessPolicies.csv` - CA policy configuration
 - `PasswordPolicy.csv` - Password policy settings
+- `InactiveAccounts.csv` - Inactive user accounts with risk assessment
 - `SecurityHygiene-Summary.txt` - Critical findings and recommendations
 
 **Key findings it identifies:**
@@ -397,13 +399,20 @@ As of September 2024, Microsoft deprecated the default PnP Management Shell app,
 - Missing or disabled Conditional Access policies
 - Weak password policies
 - Excessive Global Administrators
+- Inactive accounts with licenses (wasted costs)
+- Inactive enabled accounts (security risk)
+- Accounts that never signed in
 
 **Parameters:**
 - `OutputFolder` (optional): Custom output directory
+- `InactiveDaysThreshold` (optional, default: 30): Number of days without sign-in to consider an account inactive
 
 **Example:**
 ```powershell
 .\06-Export-SecurityHygiene.ps1
+
+# Check for accounts inactive for 90+ days instead of 30
+.\06-Export-SecurityHygiene.ps1 -InactiveDaysThreshold 90
 ```
 
 **Critical for:** Organizations without formal security policies
@@ -842,7 +851,7 @@ For a complete audit, run scripts in this order:
 | **Email** | 03-Export-SharedMailboxes.ps1 | Shared mailboxes, permissions | Inactive mailboxes, excessive permissions |
 | **Collaboration** | 04-Export-Groups.ps1 | All group types, membership | Groups without owners, empty groups |
 | **Governance** | 05-Export-OrphanedResources.ps1 | Orphaned/inactive resources | No accountability, wasted licenses |
-| **Authentication** | 06-Export-SecurityHygiene.ps1 | MFA, legacy auth, Conditional Access | No MFA, legacy protocols enabled, no CA policies |
+| **Authentication** | 06-Export-SecurityHygiene.ps1 | MFA, legacy auth, Conditional Access, inactive accounts | No MFA, legacy protocols enabled, no CA policies, inactive accounts with licenses |
 | **Data Sharing** | 07-Export-PermissionSprawl.ps1 | External access, guest users, oversharing | Anonymous links, no domain restrictions |
 | **Email Security** | 08-Export-EmailHygiene.ps1 | Forwarding, inbox rules, retention | External forwarding, suspicious rules |
 | **Third-Party Apps** | 09-Export-ThirdPartyApps.ps1 | OAuth grants, app permissions | High-risk permissions, org-wide consents |
